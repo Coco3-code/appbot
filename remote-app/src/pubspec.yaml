@@ -1,0 +1,15 @@
+name: robot_remote
+description: Telecommande BLE du robot ramasseur de dechets.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^1.32.0
+
+flutter:
+  uses-material-design: true
