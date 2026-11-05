@@ -3,6 +3,10 @@ import CoreBluetooth
 final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     static let serviceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
     static let charUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    static let statusUUID = CBUUID(string: "6E400004-B5A3-F393-E0A9-E50E24DCCA9E")
+
+    /// Derniere commande manuelle (code ASCII : F, B, L, R, X) notifiee par l'ESP32
+    private(set) var lastCmd: UInt8 = 88
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -42,11 +46,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        for s in p.services ?? [] { p.discoverCharacteristics([Self.charUUID], for: s) }
+        for s in p.services ?? [] { p.discoverCharacteristics([Self.charUUID, Self.statusUUID], for: s) }
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
-        characteristic = s.characteristics?.first
+        for c in s.characteristics ?? [] {
+            if c.uuid == Self.charUUID { characteristic = c }
+            if c.uuid == Self.statusUUID { p.setNotifyValue(true, for: c) }
+        }
+    }
+
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
+        guard c.uuid == Self.statusUUID, let d = c.value, d.count >= 2 else { return }
+        lastCmd = d[1]
     }
 
     func send(_ data: Data) {

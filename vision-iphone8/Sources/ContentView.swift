@@ -25,6 +25,11 @@ struct ContentView: View {
             VStack(spacing: 4) {
                 Text(detector.label).font(.title2).bold()
                 BLEStatus(ble: detector.ble)
+                Button(detector.recording ? "Arreter (\(detector.savedCount) images)" : "Enregistrer la conduite") {
+                    detector.toggleRecording()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(detector.recording ? .red : .blue)
             }
             .padding()
             .background(.ultraThinMaterial)
