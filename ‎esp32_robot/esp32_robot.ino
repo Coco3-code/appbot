@@ -1,7 +1,7 @@
 // Robot ramasseur de dechets : ESP32 = cerveau.
 // - iPhone 8 (camera) ecrit dans VISION  : STOP / POSITION / GO / OBSTACLES / CONDUITE
 // - iPhone 11 / Android ecrit dans CMD   : A (auto), M (manuel), F B L R (direction), X (stop)
-// - L'ESP32 notifie son etat sur STATUS  : 0 manuel, 1 errance, 2 stop dechet, 3 ramassage, 4 securite, 5 personne
+// - L'ESP32 notifie son etat sur STATUS  : 0 manuel, 1 errance, 2 stop dechet, 3 ramassage, 4 securite, 5 personne, 6 approche
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -17,7 +17,19 @@ const int ENA = 25, IN1 = 26, IN2 = 27;   // moteur gauche
 const int ENB = 14, IN3 = 32, IN4 = 33;   // moteur droit
 const int SPEED = 150;                     // 0..255
 
-enum State : uint8_t { MANUEL, ERRANCE, STOP_DECHET, RAMASSAGE, SECURITE, PERSONNE };
+// ---- Approche du dechet (A CALIBRER avec ton bras) ----
+const int NEAR_Y = 200;          // bord bas du dechet dans l'image (0 = haut, 255 = bas) : au-dela = a portee du bras
+const int CENTER_TOL = 30;       // tolerance de centrage horizontal (sur 255)
+const int APPROACH_SPEED = 110;  // plus lent que la vitesse normale
+
+// ---- Capteur a ultrasons HC-SR04 (ECHO passe par un diviseur de tension 1k + 2k !) ----
+const int TRIG_PIN = 17, ECHO_PIN = 18;
+const int STOP_CM = 25;        // errance : obstacle plus proche que ca = on tourne
+const int MANUAL_STOP_CM = 15; // manuel : on refuse d'avancer plus pres que ca
+const int HARD_STOP_CM = 8;    // approche d'un dechet : arret absolu
+int frontCm = 999;             // derniere distance mesuree (999 = rien en vue)
+
+enum State : uint8_t { MANUEL, ERRANCE, STOP_DECHET, RAMASSAGE, SECURITE, PERSONNE, APPROCHE };
 State state = MANUEL;
 BLECharacteristic *statusChar;
 
@@ -26,6 +38,7 @@ volatile bool autoMode = false;
 volatile char manualCmd = 'X';
 volatile bool dechetStop = false;
 volatile bool havePos = false;
+volatile unsigned long lastPosMs = 0;
 volatile bool personPresent = false;
 volatile uint8_t driveCmd = 0;            // 0 avant, 1 gauche, 2 droite (suggestion du modele)
 volatile unsigned long lastDriveMs = 0;
@@ -33,6 +46,18 @@ volatile uint8_t posX, posY, posW, posH;
 volatile uint8_t obstacleMask = 0;
 volatile unsigned long lastVisionMs = 0;
 unsigned long ignoreUntil = 0;
+
+// ---------- Capteur de distance ----------
+int readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long d = pulseIn(ECHO_PIN, HIGH, 12000);   // 12 ms max = environ 2 m
+  if (d == 0) return 999;                              // rien en vue
+  return d / 58;
+}
 
 // ---------- Moteurs ----------
 void pwmInit() {
@@ -69,7 +94,10 @@ void stopMotors() { setMotors(0, 0); }
 // ---------- Comportements ----------
 void manualDrive() {
   switch (manualCmd) {
-    case 'F': setMotors(SPEED, SPEED); break;
+    case 'F':
+      if (frontCm < MANUAL_STOP_CM) stopMotors();
+      else setMotors(SPEED, SPEED);
+      break;
     case 'B': setMotors(-SPEED, -SPEED); break;
     case 'L': setMotors(-SPEED, SPEED); break;
     case 'R': setMotors(SPEED, -SPEED); break;
@@ -79,7 +107,7 @@ void manualDrive() {
 
 void wander() {
   bool L = obstacleMask & 1, C = obstacleMask & 2, R = obstacleMask & 4;
-  if (C || (L && R)) { setMotors(SPEED, -SPEED); return; }   // bloque : pivoter
+  if (C || (L && R) || frontCm < STOP_CM) { setMotors(SPEED, -SPEED); return; }   // bloque : pivoter
 
   if (millis() - lastDriveMs < 500) {                        // conduite apprise (modele drive)
     switch (driveCmd) {
@@ -93,6 +121,15 @@ void wander() {
   if (L)      setMotors(SPEED, 0);        // obstacle a gauche : tourner a droite
   else if (R) setMotors(0, SPEED);        // obstacle a droite : tourner a gauche
   else        setMotors(SPEED, SPEED);    // libre : avancer
+}
+
+// Se diriger vers le dechet : centrer horizontalement, puis avancer.
+void approach() {
+  if (frontCm < HARD_STOP_CM) { stopMotors(); return; }   // trop pres de quelque chose
+  int err = (int)posX - 128;                                      // > 0 : dechet a droite
+  if (err > CENTER_TOL)       setMotors(APPROACH_SPEED, -APPROACH_SPEED);   // pivoter a droite
+  else if (err < -CENTER_TOL) setMotors(-APPROACH_SPEED, APPROACH_SPEED);   // pivoter a gauche
+  else                        setMotors(APPROACH_SPEED, APPROACH_SPEED);    // avancer
 }
 
 // A REMPLACER quand le bras sera pret.
@@ -133,6 +170,7 @@ class VisionCB : public BLECharacteristicCallbacks {
           posX = (uint8_t)v[1]; posY = (uint8_t)v[2];
           posW = (uint8_t)v[3]; posH = (uint8_t)v[4];
           havePos = true;
+          lastPosMs = millis();
         }
         break;
       case 3: dechetStop = false; havePos = false; break;
@@ -170,6 +208,8 @@ void setup() {
   Serial.begin(115200);
   int pins[] = {IN1, IN2, IN3, IN4};
   for (int p : pins) pinMode(p, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
   pwmInit();
   stopMotors();
 
@@ -200,6 +240,7 @@ void loop() {
   static unsigned long last = 0, lastNotify = 0;
   if (millis() - last < 50) return;
   last = millis();
+  frontCm = readDistanceCm();
 
   // Securite : en auto, la camera est le seul detecteur d'obstacles.
   // Si l'iPhone 8 n'envoie plus rien pendant 1,5 s, on s'arrete.
@@ -215,12 +256,18 @@ void loop() {
     stopMotors();             // une personne est visible : arret total, pas de ramassage
     setState(PERSONNE);
   } else if (dechetStop && millis() > ignoreUntil) {
-    stopMotors();
-    setState(STOP_DECHET);
-    if (havePos) {
+    bool posFresh = havePos && (millis() - lastPosMs < 700);
+    if (!posFresh) {                                   // dechet vu, position pas (ou plus) fiable : on attend
+      stopMotors();
+      setState(STOP_DECHET);
+    } else if ((int)posY + (int)posH / 2 >= NEAR_Y) {  // assez proche : arret et ramassage
+      stopMotors();
       setState(RAMASSAGE);
       pickup(posX, posY, posW, posH);
-      ignoreUntil = millis() + 8000;   // laisse le temps au dechet de disparaitre
+      ignoreUntil = millis() + 8000;                   // laisse le temps au dechet de disparaitre
+    } else {                                           // trop loin : s'en approcher
+      setState(APPROCHE);
+      approach();
     }
   } else {
     setState(ERRANCE);
